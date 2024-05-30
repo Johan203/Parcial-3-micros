@@ -1,0 +1,187 @@
+#include <xc.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
+
+
+#define _XTAL_FREQ 16000000  // Frecuencia del oscilador (16 MHz)
+
+
+// Configuración del PIC
+#pragma config FOSC = HS        // Oscilador HS
+#pragma config WDTE = OFF       // Watchdog Timer desactivado
+#pragma config PWRTE = ON       // Power-up Timer activado
+#pragma config BOREN = ON       // Brown-out Reset activado
+#pragma config LVP = OFF        // Low-Voltage Programming desactivado
+#pragma config CPD = OFF        // Data EEPROM Code Protection desactivado
+#pragma config WRT = OFF        // Flash Program Memory Write Enable desactivado
+#pragma config CP = OFF         // Flash Program Memory Code Protection desactivado
+
+
+// Prototipos de funciones
+void initADC(void);
+uint16_t readADC(void);
+void initUART(void);
+void sendUART(char *data);
+void initI2C(void);
+void writeI2C(uint8_t address, uint8_t reg, uint8_t data);
+void initTimer(void);
+void __interrupt() ISR(void);
+
+
+// Variables globales
+volatile uint8_t sampleFlag = 0;
+volatile uint8_t buttonPressed = 0;
+
+
+// Inicialización del ADC
+void initADC(void) {
+    ADCON0 = 0x01;  // Seleccionar canal AN0 y encender ADC
+    ADCON1 = 0x0E;  // AN0 como entrada analógica, VSS y VDD como referencia
+    ADCON2 = 0xA9;  // ADFM (resultados justificados a la derecha), adquisición TAD = 12, FOSC/8
+}
+
+
+// Leer valor del ADC
+uint16_t readADC(void) {
+    ADCON0bits.GO_DONE = 1;  // Iniciar conversión
+    while (ADCON0bits.GO_DONE);  // Esperar a que termine la conversión
+    return ((ADRESH << 8) + ADRESL);  // Retornar resultado de 10 bits
+}
+
+
+// Inicialización del UART
+void initUART(void) {
+    TXSTAbits.BRGH = 1;  // Alta velocidad
+    SPBRG = 51;  // Baud rate a 19200 bps
+    TXSTAbits.SYNC = 0;  // Modo asincrónico
+    RCSTAbits.SPEN = 1;  // Habilitar puerto serial
+    TXSTAbits.TXEN = 1;  // Habilitar transmisión
+    RCSTAbits.CREN = 1;  // Habilitar recepción
+}
+
+
+// Enviar datos por UART
+void sendUART(char *data) {
+    while (*data != '\0') {
+        while (!TXSTAbits.TRMT);  // Esperar a que el buffer esté vacío
+        TXREG = *data;  // Enviar carácter
+        data++;
+    }
+}
+
+
+// Inicialización del I2C
+void initI2C(void) {
+    SSPCON1 = 0x28;  // Configurar MSSP en modo I2C master
+    SSPADD = (_XTAL_FREQ / (4 * 100000)) - 1;  // Configurar velocidad a 100 kHz
+    SSPSTAT = 0;
+}
+
+
+// Escribir dato en el bus I2C
+void writeI2C(uint8_t address, uint8_t reg, uint8_t data) {
+    SSPCON2bits.SEN = 1;  // Enviar condición de inicio
+    while (SSPCON2bits.SEN);
+
+
+    SSPBUF = address;  // Enviar dirección del esclavo con bit de escritura
+    while (!SSPSTATbits.BF);
+
+
+    SSPBUF = reg;  // Enviar registro
+    while (!SSPSTATbits.BF);
+
+
+    SSPBUF = data;  // Enviar dato
+    while (!SSPSTATbits.BF);
+
+
+    SSPCON2bits.PEN = 1;  // Enviar condición de parada
+    while (SSPCON2bits.PEN);
+}
+
+
+// Inicialización del Timer
+void initTimer(void) {
+    T0CON = 0x87;  // Configurar Timer0 con prescaler 1:256
+    TMR0 = 3036;  // Valor para 1 segundo de interrupción
+    INTCONbits.TMR0IE = 1;  // Habilitar interrupción del Timer0
+    INTCONbits.GIE = 1;  // Habilitar interrupciones globales
+}
+
+
+// Interrupción
+void __interrupt() ISR(void) {
+    if (INTCONbits.TMR0IF) {
+        INTCONbits.TMR0IF = 0;  // Limpiar bandera de interrupción del Timer0
+        TMR0 = 3036;  // Recargar valor para 1 segundo
+        sampleFlag = 1;  // Señalar muestreo
+    }
+    if (INTCONbits.INT0IF) {
+        INTCONbits.INT0IF = 0;  // Limpiar bandera de interrupción externa
+        buttonPressed = 1;  // Señalar botón presionado
+    }
+}
+
+
+// Programa principal
+void main(void) {
+    uint16_t adcValue, rmsSum = 0, meanValue = 0;
+    uint32_t period = 0;
+    float frequency = 0.0, rmsValue = 0.0, acValue = 0.0;
+    char buffer[50];
+
+
+    initADC();
+    initUART();
+    initI2C();
+    initTimer();
+
+
+    // Configurar interrupción externa en INT0 (botón)
+    INTCON2bits.INTEDG0 = 0;  // Interrupción en flanco de bajada
+    INTCONbits.INT0IE = 1;  // Habilitar interrupción externa INT0
+
+
+    while (1) {
+        if (sampleFlag) {
+            sampleFlag = 0;
+            rmsSum = 0;
+            meanValue = 0;
+
+
+            // Promediar 8 muestras
+            for (uint8_t i = 0; i < 8; i++) {
+                adcValue = readADC();
+                meanValue += adcValue;
+                rmsSum += adcValue * adcValue;
+                __delay_us(125);  // Esperar para siguiente muestra (frecuencia de 4 kHz)
+            }
+            meanValue /= 8;
+            rmsValue = sqrt(rmsSum / 8.0);
+            acValue = rmsValue * sqrt(2);
+
+
+            // Calcular frecuencia y período
+            period = 1 / (4.0 * 1000);  // Período para 4 kHz
+            frequency = 1.0 / period;
+
+
+            // Enviar datos por UART
+            sprintf(buffer, "Periodo: %lu ms, Frecuencia: %.2f Hz, RMS: %.2f V, AC: %.2f V\r\n", period, frequency, rmsValue, acValue);
+            sendUART(buffer);
+
+
+            // Enviar datos por I2C si el botón fue presionado
+            if (buttonPressed) {
+                buttonPressed = 0;
+                writeI2C(0xD0, 0x14, (uint8_t)(period >> 8));  // Enviar MSB del período
+                writeI2C(0xD0, 0x15, (uint8_t)period);  // Enviar LSB del período
+                writeI2C(0xD0, 0x16, (uint8_t)frequency);  // Enviar frecuencia
+                writeI2C(0xD0, 0x17, (uint8_t)rmsValue);  // Enviar RMS
+                writeI2C(0xD0, 0x18, (uint8_t)acValue);  // Enviar AC
+            }
+        }
+    }
+}
